@@ -209,6 +209,215 @@
             
               
                 
+                <a class="post-title-link" href="/2016/01/07/Improve-the-insert-performace-in-sqlite/" itemprop="url">
+                  提升SQLite插入速度
+                </a>
+              
+            
+          </h1>
+        
+
+        <div class="post-meta">
+          <span class="post-time">
+            发表于
+            <time itemprop="dateCreated" datetime="2016-01-07T17:53:31+08:00" content="2016-01-07">
+              2016-01-07
+            </time>
+          </span>
+
+          
+
+          
+            
+          
+
+          
+
+        </div>
+      </header>
+    
+
+
+    <div class="post-body">
+
+      
+      
+
+      
+        
+          <span itemprop="articleBody">
+            
+              <p>最近在做一个尝试，将原来直接使用二进制格式保存的文件解析，再用数据库进行管理。做这个尝试的初衷是因为原来格式的文件大小越来越大，已经到达GB的级别，即使只是想查看其中的某个小内容，都需要整体读取，内存占用大。另外，发生修改，保存时，整体重新保存也不是很经济。因此，采取了轻量级的文件型数据库作为数据库解决方案。但在实行过程中，我发现SQLite的插入效率慢得令人发指。查阅一些资料后，将速度提升到了一个可以接受的范围，在此将内容纪录下来。</p>
+<h2 id="u6D4B_u8BD5_u6837_u4F8B"><a href="#u6D4B_u8BD5_u6837_u4F8B" class="headerlink" title="测试样例"></a>测试样例</h2><p>我的设想是：将原有的二进制文件的内容解析出来，分块，然后每一块的数据作为一个数据条目，那么我就能够根据需求，分块存取了。所以我需要在实验之前，建立如下的表：</p>
+<pre><code>CREATE TABLE t (ID INTEGER NOT NULL, DATA BLOB)
+</code></pre><p>为了便于测试，我们将问题简化成现有100MB的数据，我们将其分割成100000份1K的小数据块，插入到SQLite数据库中。</p>
+<h2 id="u66B4_u529B_u63D2_u5165"><a href="#u66B4_u529B_u63D2_u5165" class="headerlink" title="暴力插入"></a>暴力插入</h2><p>最开始直接的思路就是调用SQLite api中直接执行SQL语句的函数：</p>
+<pre><code>int sqlite3_exec(
+    sqlite3*,                                  /* An open database */
+    const char *sql,                           /* SQL to be evaluated */
+    int (*callback)(void*,int,char**,char**),  /* Callback function */
+    void *,                                    /* 1st argument to callback */
+    char **errmsg                              /* Error msg written here */
+);
+</code></pre><p>程序代码大致是如下的样子：</p>
+<pre><code>int cnt = 100000;
+for (int i = 0; i &lt; cnt; i++)
+{
+    char insert_cmd[100];
+    sprintf(insert_cmd, &quot;INSERT INTO t1 VALUES(%d, zeroblob(1000))&quot;, i + 1);
+    rc = sqlite3_exec(db, insert_cmd, 0, 0, &amp;zErrMsg);
+    if (rc != SQLITE_OK)
+    {
+        std::cout &lt;&lt; &quot;SQL error: &quot; + std::string(zErrMsg) &lt;&lt; std::endl;
+        sqlite3_free(zErrMsg);
+        sqlite3_close(db);
+        getchar();
+        return 1;
+    }
+}
+</code></pre><p>直接使用INSERT语句插入1KB的数据，总共100MB的数据需要1804.39s，平均每秒执行55.42次插入。</p>
+<h2 id="SQLite_u7684_u4E8B_u52A1"><a href="#SQLite_u7684_u4E8B_u52A1" class="headerlink" title="SQLite的事务"></a>SQLite的事务</h2><p>调用visual studio的性能分析工具，可以发现时间主要消耗在<code>vbdeCommit()</code>这个函数当中(visual studio真乃神器)</p>
+<p><img src="/uploads/images/improve-sqlite-insert-performance/1.JPG" alt="函数时间统计"></p>
+<p>这里就要引出数据库中的一个概念，<em>事务</em>。事务可以理解为数据库的操作单元。没调用<code>sqlite3_exec()</code>一次，就会隐式地开启一次事务。所以之前的代码，每插入一次数据，事务就会反复被开启和提交，造成很大的IO消耗。</p>
+<p>好在事务是可以显式开启和关闭的，我们可以将所有数据插入后，再一起提交，则能够大大提高IO效率，从而加快插入速度。</p>
+<pre><code>sqlite3_exec(db, &quot;BEGIN&quot;, 0, 0, &amp;zErrMsg);
+int cnt = 100000;
+for (int i = 0; i &lt; cnt; i++)
+{
+    char insert_cmd[100];
+    sprintf(insert_cmd, &quot;INSERT INTO t1 VALUES(%d, zeroblob(1000))&quot;, i + 1);
+    rc = sqlite3_exec(db, insert_cmd, 0, 0, &amp;zErrMsg);
+    if (rc != SQLITE_OK)
+    {
+        std::cout &lt;&lt; &quot;SQL error: &quot; + std::string(zErrMsg) &lt;&lt; std::endl;
+        sqlite3_free(zErrMsg);
+        sqlite3_close(db);
+        getchar();
+        return 1;
+    }
+}
+sqlite3_exec(db, &quot;COMMIT&quot;, 0, 0, &amp;zErrMsg);
+</code></pre><p>经过修改之后，只需要2.12s完成操作，平均每秒47169.8次插入。</p>
+<p>##　使用sqlite3_prepare_v2<br>对于之前的例子，如果我们将数据片段缩小为0.1K，那么100MB的数据则需要分割成1000000份，结果需要7.79s完成操作。因此，执行的插入语句越多，时间消耗越大。</p>
+<p>执行一条SQL语句，实际经历了prepared once(准备)，evaluated(求值)，destroyed(销毁)的过程。而<code>sqlite3_prepare_v2</code>就是对SQL语句字符串进行语法分析，并将其编译成目标代码。对于大量数据的插入操作来说，每次都进行准备工作，太浪费时间，其实我们只需要准备一次，就可以重复求值了，这可以节省下语法分析，编译的时间。</p>
+<pre><code>sqlite3_exec(db, &quot;BEGIN&quot;, 0, 0, &amp;zErrMsg);
+int cnt = 1000000;
+sqlite3_stmt *stmt;
+const char *sql = &quot;INSERT INTO t1 VALUES(?,zeroblob(100))&quot;;
+sqlite3_prepare_v2(db, sql, strlen(sql), &amp;stmt, 0);
+for (int i = 0; i &lt; cnt; i++)
+{
+    sqlite3_reset(stmt);
+    sqlite3_bind_int(stmt, 1, i + 1);
+    sqlite3_step(stmt);
+}
+sqlite3_exec(db, &quot;COMMIT&quot;, 0, 0, &amp;zErrMsg);
+</code></pre><p>经测试，同样采取0.1K的数据片段，1000000份数据，上述代码完成操作需要的时间是2.332s，平均每秒能够执行428816次插入操作。</p>
+<h2 id="u603B_u7ED3"><a href="#u603B_u7ED3" class="headerlink" title="总结"></a>总结</h2><p>对于大数据的重复插入操作，采取事务+sqlite3_prepare_v2的方式能极大的提升插入效率。</p>
+<h2 id="u4EE3_u7801"><a href="#u4EE3_u7801" class="headerlink" title="代码"></a>代码</h2><pre><code>int main()
+{
+    sqlite3 *db;
+    int rc;
+    char *zErrMsg = 0;
+
+    rc = sqlite3_open(&quot;test.db&quot;, &amp;db);
+    if (rc)
+    {
+        std::cout &lt;&lt; &quot;Can&apos;t open database: &quot; &lt;&lt; std::string(sqlite3_errmsg(db)) &lt;&lt; std::endl;
+        sqlite3_close(db);
+        getchar();
+        return 1;
+    }
+
+    std::string cmd = &quot;CREATE TABLE t1 (ID INTEGER NOT NULL, DATA BLOB)&quot;;
+    rc = sqlite3_exec(db, cmd.c_str(), 0, 0, &amp;zErrMsg);
+    if (rc != SQLITE_OK)
+    {
+        std::cout &lt;&lt; &quot;SQL error: &quot; + std::string(zErrMsg) &lt;&lt; std::endl;
+        sqlite3_free(zErrMsg);
+        sqlite3_close(db);
+        getchar();
+        return 1;
+    }
+
+    clock_t t1 = clock();
+    sqlite3_exec(db, &quot;BEGIN&quot;, 0, 0, &amp;zErrMsg);
+    int cnt = 1000000;
+    /*for (int i = 0; i &lt; cnt; i++)
+    {
+        char insert_cmd[100];
+        sprintf(insert_cmd, &quot;INSERT INTO t1 VALUES(%d, zeroblob(100))&quot;, i + 1);
+        rc = sqlite3_exec(db, insert_cmd, 0, 0, &amp;zErrMsg);
+        if (rc != SQLITE_OK)
+        {
+            std::cout &lt;&lt; &quot;SQL error: &quot; + std::string(zErrMsg) &lt;&lt; std::endl;
+            sqlite3_free(zErrMsg);
+            sqlite3_close(db);
+            getchar();
+            return 1;
+        }
+    }*/
+    sqlite3_stmt *stmt;
+    const char *sql = &quot;INSERT INTO t1 VALUES(?,zeroblob(100))&quot;;
+    sqlite3_prepare_v2(db, sql, strlen(sql), &amp;stmt, 0);
+    for (int i = 0; i &lt; cnt; i++)
+    {
+        sqlite3_reset(stmt);
+        sqlite3_bind_int(stmt, 1, i + 1);
+        sqlite3_step(stmt);
+    }
+    rc = sqlite3_exec(db, &quot;COMMIT&quot;, 0, 0, &amp;zErrMsg);
+    clock_t t2 = clock();
+    sqlite3_close(db);
+
+    double time = double(t2 - t1) / CLOCKS_PER_SEC;
+    std::cout &lt;&lt; &quot;cost time: &quot; &lt;&lt; time &lt;&lt; &quot;s.&quot; &lt;&lt; std::endl;
+    std::cout &lt;&lt; &quot;insert speed: &quot; &lt;&lt; cnt / time &lt;&lt; &quot;cmd/s.&quot; &lt;&lt; std::endl;
+    getchar();
+    return 0;
+}
+</code></pre>
+            
+          </span>
+        
+      
+    </div>
+
+    <footer class="post-footer">
+      
+
+      
+
+      
+      
+        <div class="post-eof"></div>
+      
+    </footer>
+  </article>
+
+
+    
+      
+
+  
+  
+
+  
+  
+  
+
+  <article class="post post-type-normal " itemscope itemtype="http://schema.org/Article">
+
+    
+      <header class="post-header">
+
+        
+        
+          <h1 class="post-title" itemprop="name headline">
+            
+            
+              
+                
                 <a class="post-title-link" href="/2016/01/06/hello-world/" itemprop="url">
                   Hello World
                 </a>
@@ -319,7 +528,7 @@
         <nav class="site-state motion-element">
           <div class="site-state-item site-state-posts">
             <a href="/archives">
-              <span class="site-state-item-count">1</span>
+              <span class="site-state-item-count">2</span>
               <span class="site-state-item-name">日志</span>
             </a>
           </div>
@@ -333,7 +542,7 @@
 
           <div class="site-state-item site-state-tags">
             <a href="/tags">
-              <span class="site-state-item-count">0</span>
+              <span class="site-state-item-count">1</span>
               <span class="site-state-item-name">标签</span>
               </a>
           </div>
