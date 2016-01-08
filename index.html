@@ -255,104 +255,15 @@
 <p>直接使用INSERT语句插入1KB的数据，总共100MB的数据需要1804.39s，平均每秒执行55.42次插入。</p>
 <h2 id="SQLite_u7684_u4E8B_u52A1"><a href="#SQLite_u7684_u4E8B_u52A1" class="headerlink" title="SQLite的事务"></a>SQLite的事务</h2><p>调用visual studio的性能分析工具，可以发现时间主要消耗在<code>vbdeCommit()</code>这个函数当中(visual studio真乃神器)</p>
 <p><img src="/uploads/images/improve-sqlite-insert-performance/1.JPG" alt="函数时间统计"></p>
-<p>这里就要引出数据库中的一个概念，<em>事务</em>。事务可以理解为数据库的操作单元。没调用<code>sqlite3_exec()</code>一次，就会隐式地开启一次事务。所以之前的代码，每插入一次数据，事务就会反复被开启和提交，造成很大的IO消耗。</p>
+<p>这里就要引出数据库中的一个概念，<em>事务</em>。事务可以理解为数据库的操作单元。每调用<code>sqlite3_exec()</code>一次，就会隐式地开启一次事务。所以之前的代码，每插入一次数据，事务就会反复被开启和提交，造成很大的IO消耗。</p>
 <p>好在事务是可以显式开启和关闭的，我们可以将所有数据插入后，再一起提交，则能够大大提高IO效率，从而加快插入速度。<br>    <figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br></pre></td><td class="code"><pre><span class="line">sqlite3_exec(db, <span class="string">"BEGIN"</span>, <span class="number">0</span>, <span class="number">0</span>, &amp;zErrMsg);</span><br><span class="line"><span class="keyword">int</span> cnt = <span class="number">100000</span>;</span><br><span class="line"><span class="keyword">for</span> (<span class="keyword">int</span> i = <span class="number">0</span>; i &lt; cnt; i++)</span><br><span class="line">&#123;</span><br><span class="line">    <span class="keyword">char</span> insert_cmd[<span class="number">100</span>];</span><br><span class="line">    <span class="built_in">sprintf</span>(insert_cmd, <span class="string">"INSERT INTO t1 VALUES(%d, zeroblob(1000))"</span>, i + <span class="number">1</span>);</span><br><span class="line">    rc = sqlite3_exec(db, insert_cmd, <span class="number">0</span>, <span class="number">0</span>, &amp;zErrMsg);</span><br><span class="line">    <span class="keyword">if</span> (rc != SQLITE_OK)</span><br><span class="line">    &#123;</span><br><span class="line">        <span class="built_in">std</span>::<span class="built_in">cout</span> &lt;&lt; <span class="string">"SQL error: "</span> + <span class="built_in">std</span>::<span class="built_in">string</span>(zErrMsg) &lt;&lt; <span class="built_in">std</span>::endl;</span><br><span class="line">        sqlite3_free(zErrMsg);</span><br><span class="line">        sqlite3_close(db);</span><br><span class="line">        getchar();</span><br><span class="line">        <span class="keyword">return</span> <span class="number">1</span>;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br><span class="line">sqlite3_exec(db, <span class="string">"COMMIT"</span>, <span class="number">0</span>, <span class="number">0</span>, &amp;zErrMsg);</span><br></pre></td></tr></table></figure></p>
 <p>经过修改之后，只需要2.12s完成操作，平均每秒47169.8次插入。</p>
-<p>##　使用sqlite3_prepare_v2<br>对于之前的例子，如果我们将数据片段缩小为0.1K，那么100MB的数据则需要分割成1000000份，结果需要7.79s完成操作。因此，执行的插入语句越多，时间消耗越大。</p>
+<h2 id="u4F7F_u7528sqlite3_prepare_v2"><a href="#u4F7F_u7528sqlite3_prepare_v2" class="headerlink" title="使用sqlite3_prepare_v2"></a>使用sqlite3_prepare_v2</h2><p>对于之前的例子，如果我们将数据片段缩小为0.1K，那么100MB的数据则需要分割成1000000份，结果需要7.79s完成操作。因此，执行的插入语句越多，时间消耗越大。</p>
 <p>执行一条SQL语句，实际经历了prepared once(准备)，evaluated(求值)，destroyed(销毁)的过程。而<code>sqlite3_prepare_v2</code>就是对SQL语句字符串进行语法分析，并将其编译成目标代码。对于大量数据的插入操作来说，每次都进行准备工作，太浪费时间，其实我们只需要准备一次，就可以重复求值了，这可以节省下语法分析，编译的时间。<br>    <figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line">sqlite3_exec(db, <span class="string">"BEGIN"</span>, <span class="number">0</span>, <span class="number">0</span>, &amp;zErrMsg);</span><br><span class="line"><span class="keyword">int</span> cnt = <span class="number">1000000</span>;</span><br><span class="line">sqlite3_stmt *stmt;</span><br><span class="line"><span class="keyword">const</span> <span class="keyword">char</span> *sql = <span class="string">"INSERT INTO t1 VALUES(?,zeroblob(100))"</span>;</span><br><span class="line">sqlite3_prepare_v2(db, sql, <span class="built_in">strlen</span>(sql), &amp;stmt, <span class="number">0</span>);</span><br><span class="line"><span class="keyword">for</span> (<span class="keyword">int</span> i = <span class="number">0</span>; i &lt; cnt; i++)</span><br><span class="line">&#123;</span><br><span class="line">    sqlite3_reset(stmt);</span><br><span class="line">    sqlite3_bind_int(stmt, <span class="number">1</span>, i + <span class="number">1</span>);</span><br><span class="line">    sqlite3_step(stmt);</span><br><span class="line">&#125;</span><br><span class="line">sqlite3_exec(db, <span class="string">"COMMIT"</span>, <span class="number">0</span>, <span class="number">0</span>, &amp;zErrMsg);</span><br></pre></td></tr></table></figure></p>
 <p>经测试，同样采取0.1K的数据片段，1000000份数据，上述代码完成操作需要的时间是2.332s，平均每秒能够执行428816次插入操作。</p>
 <h2 id="u603B_u7ED3"><a href="#u603B_u7ED3" class="headerlink" title="总结"></a>总结</h2><p>对于大数据的重复插入操作，采取事务+sqlite3_prepare_v2的方式能极大的提升插入效率。</p>
 <h2 id="u4EE3_u7801"><a href="#u4EE3_u7801" class="headerlink" title="代码"></a>代码</h2><pre><code><figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br><span class="line">43</span><br><span class="line">44</span><br><span class="line">45</span><br><span class="line">46</span><br><span class="line">47</span><br><span class="line">48</span><br><span class="line">49</span><br><span class="line">50</span><br><span class="line">51</span><br><span class="line">52</span><br><span class="line">53</span><br><span class="line">54</span><br><span class="line">55</span><br><span class="line">56</span><br><span class="line">57</span><br><span class="line">58</span><br><span class="line">59</span><br><span class="line">60</span><br><span class="line">61</span><br><span class="line">62</span><br></pre></td><td class="code"><pre><span class="line"><span class="function"><span class="keyword">int</span> <span class="title">main</span><span class="params">()</span></span><br><span class="line"></span>&#123;</span><br><span class="line">    sqlite3 *db;</span><br><span class="line">    <span class="keyword">int</span> rc;</span><br><span class="line">    <span class="keyword">char</span> *zErrMsg = <span class="number">0</span>;</span><br><span class="line">    </span><br><span class="line">    rc = sqlite3_open(<span class="string">"test.db"</span>, &amp;db);</span><br><span class="line">    <span class="keyword">if</span> (rc)</span><br><span class="line">    &#123;</span><br><span class="line">        <span class="built_in">std</span>::<span class="built_in">cout</span> &lt;&lt; <span class="string">"Can't open database: "</span> &lt;&lt; <span class="built_in">std</span>::<span class="built_in">string</span>(sqlite3_errmsg(db)) &lt;&lt; <span class="built_in">std</span>::endl;</span><br><span class="line">        sqlite3_close(db);</span><br><span class="line">        getchar();</span><br><span class="line">        <span class="keyword">return</span> <span class="number">1</span>;</span><br><span class="line">    &#125;</span><br><span class="line">    </span><br><span class="line">    <span class="built_in">std</span>::<span class="built_in">string</span> cmd = <span class="string">"CREATE TABLE t1 (ID INTEGER NOT NULL, DATA BLOB)"</span>;</span><br><span class="line">    rc = sqlite3_exec(db, cmd.c_str(), <span class="number">0</span>, <span class="number">0</span>, &amp;zErrMsg);</span><br><span class="line">    <span class="keyword">if</span> (rc != SQLITE_OK)</span><br><span class="line">    &#123;</span><br><span class="line">        <span class="built_in">std</span>::<span class="built_in">cout</span> &lt;&lt; <span class="string">"SQL error: "</span> + <span class="built_in">std</span>::<span class="built_in">string</span>(zErrMsg) &lt;&lt; <span class="built_in">std</span>::endl;</span><br><span class="line">        sqlite3_free(zErrMsg);</span><br><span class="line">        sqlite3_close(db);</span><br><span class="line">        getchar();</span><br><span class="line">        <span class="keyword">return</span> <span class="number">1</span>;</span><br><span class="line">    &#125;</span><br><span class="line">    </span><br><span class="line">    <span class="keyword">clock_t</span> t1 = clock();</span><br><span class="line">    sqlite3_exec(db, <span class="string">"BEGIN"</span>, <span class="number">0</span>, <span class="number">0</span>, &amp;zErrMsg);</span><br><span class="line">    <span class="keyword">int</span> cnt = <span class="number">1000000</span>;</span><br><span class="line">    <span class="comment">/*for (int i = 0; i &lt; cnt; i++)</span><br><span class="line">    &#123;</span><br><span class="line">        char insert_cmd[100];</span><br><span class="line">        sprintf(insert_cmd, "INSERT INTO t1 VALUES(%d, zeroblob(100))", i + 1);</span><br><span class="line">        rc = sqlite3_exec(db, insert_cmd, 0, 0, &amp;zErrMsg);</span><br><span class="line">        if (rc != SQLITE_OK)</span><br><span class="line">        &#123;</span><br><span class="line">            std::cout &lt;&lt; "SQL error: " + std::string(zErrMsg) &lt;&lt; std::endl;</span><br><span class="line">            sqlite3_free(zErrMsg);</span><br><span class="line">            sqlite3_close(db);</span><br><span class="line">            getchar();</span><br><span class="line">            return 1;</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;*/</span></span><br><span class="line">    sqlite3_stmt *stmt;</span><br><span class="line">    <span class="keyword">const</span> <span class="keyword">char</span> *sql = <span class="string">"INSERT INTO t1 VALUES(?,zeroblob(100))"</span>;</span><br><span class="line">    sqlite3_prepare_v2(db, sql, <span class="built_in">strlen</span>(sql), &amp;stmt, <span class="number">0</span>);</span><br><span class="line">    <span class="keyword">for</span> (<span class="keyword">int</span> i = <span class="number">0</span>; i &lt; cnt; i++)</span><br><span class="line">    &#123;</span><br><span class="line">        sqlite3_reset(stmt);</span><br><span class="line">        sqlite3_bind_int(stmt, <span class="number">1</span>, i + <span class="number">1</span>);</span><br><span class="line">        sqlite3_step(stmt);</span><br><span class="line">    &#125;</span><br><span class="line">    rc = sqlite3_exec(db, <span class="string">"COMMIT"</span>, <span class="number">0</span>, <span class="number">0</span>, &amp;zErrMsg);</span><br><span class="line">    <span class="keyword">clock_t</span> t2 = clock();</span><br><span class="line">    sqlite3_close(db);</span><br><span class="line">    </span><br><span class="line">    <span class="keyword">double</span> time = <span class="keyword">double</span>(t2 - t1) / CLOCKS_PER_SEC;</span><br><span class="line">    <span class="built_in">std</span>::<span class="built_in">cout</span> &lt;&lt; <span class="string">"cost time: "</span> &lt;&lt; time &lt;&lt; <span class="string">"s."</span> &lt;&lt; <span class="built_in">std</span>::endl;</span><br><span class="line">    <span class="built_in">std</span>::<span class="built_in">cout</span> &lt;&lt; <span class="string">"insert speed: "</span> &lt;&lt; cnt / time &lt;&lt; <span class="string">"cmd/s."</span> &lt;&lt; <span class="built_in">std</span>::endl;</span><br><span class="line">    getchar();</span><br><span class="line">    <span class="keyword">return</span> <span class="number">0</span>;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
 </code></pre>
-            
-          </span>
-        
-      
-    </div>
-
-    <footer class="post-footer">
-      
-
-      
-
-      
-      
-        <div class="post-eof"></div>
-      
-    </footer>
-  </article>
-
-
-    
-      
-
-  
-  
-
-  
-  
-  
-
-  <article class="post post-type-normal " itemscope itemtype="http://schema.org/Article">
-
-    
-      <header class="post-header">
-
-        
-        
-          <h1 class="post-title" itemprop="name headline">
-            
-            
-              
-                
-                <a class="post-title-link" href="/2016/01/06/hello-world/" itemprop="url">
-                  Hello World
-                </a>
-              
-            
-          </h1>
-        
-
-        <div class="post-meta">
-          <span class="post-time">
-            发表于
-            <time itemprop="dateCreated" datetime="2016-01-06T16:14:50+08:00" content="2016-01-06">
-              2016-01-06
-            </time>
-          </span>
-
-          
-
-          
-            
-          
-
-          
-
-        </div>
-      </header>
-    
-
-
-    <div class="post-body">
-
-      
-      
-
-      
-        
-          <span itemprop="articleBody">
-            
-              <p>Welcome to <a href="https://hexo.io/" target="_blank" rel="external">Hexo</a>! This is your very first post. Check <a href="https://hexo.io/docs/" target="_blank" rel="external">documentation</a> for more info. If you get any problems when using Hexo, you can find the answer in <a href="https://hexo.io/docs/troubleshooting.html" target="_blank" rel="external">troubleshooting</a> or you can ask me on <a href="https://github.com/hexojs/hexo/issues" target="_blank" rel="external">GitHub</a>.</p>
-<h2 id="Quick_Start"><a href="#Quick_Start" class="headerlink" title="Quick Start"></a>Quick Start</h2><h3 id="Create_a_new_post"><a href="#Create_a_new_post" class="headerlink" title="Create a new post"></a>Create a new post</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">$ hexo new <span class="string">"My New Post"</span></span><br></pre></td></tr></table></figure>
-<p>More info: <a href="https://hexo.io/docs/writing.html" target="_blank" rel="external">Writing</a></p>
-<h3 id="Run_server"><a href="#Run_server" class="headerlink" title="Run server"></a>Run server</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">$ hexo server</span><br></pre></td></tr></table></figure>
-<p>More info: <a href="https://hexo.io/docs/server.html" target="_blank" rel="external">Server</a></p>
-<h3 id="Generate_static_files"><a href="#Generate_static_files" class="headerlink" title="Generate static files"></a>Generate static files</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">$ hexo generate</span><br></pre></td></tr></table></figure>
-<p>More info: <a href="https://hexo.io/docs/generating.html" target="_blank" rel="external">Generating</a></p>
-<h3 id="Deploy_to_remote_sites"><a href="#Deploy_to_remote_sites" class="headerlink" title="Deploy to remote sites"></a>Deploy to remote sites</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">$ hexo deploy</span><br></pre></td></tr></table></figure>
-<p>More info: <a href="https://hexo.io/docs/deployment.html" target="_blank" rel="external">Deployment</a></p>
-
             
           </span>
         
